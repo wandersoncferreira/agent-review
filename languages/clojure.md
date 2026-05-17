@@ -20,6 +20,11 @@ You are reviewing Clojure code. Apply these language-specific guidelines:
 - Using concat without doall when the result must be realized immediately
 - Comparing floats with = instead of a tolerance-based comparison
 
+## Structural Alternatives — Evaluate the Code NOT Written
+- When reviewing cond/case/if chains, consider whether multimethods, protocols, or a lookup map would be simpler
+- Deeply nested let blocks may signal a missing threading macro or function extraction
+- Suggest concrete rewrites when a structurally different approach (e.g. reduce, transducer, multimethod dispatch) avoids branching entirely
+
 ## Anti-Patterns
 - Large deeply nested let blocks — break into smaller functions
 - Using str for building large strings in loops instead of StringBuilder or join

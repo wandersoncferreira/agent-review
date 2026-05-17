@@ -20,6 +20,11 @@ You are reviewing TypeScript code. Apply these language-specific guidelines:
 - Enum values used in comparisons without exhaustive checks (missing switch cases)
 - Accidentally creating type: any through generic inference failures
 
+## Structural Alternatives — Evaluate the Code NOT Written
+- When reviewing if/else or switch chains, consider whether discriminated unions, lookup objects, or the strategy pattern would be simpler
+- Deeply nested ternaries or conditionals often signal a missing early return, guard clause, or data-driven dispatch
+- Suggest concrete rewrites when a structurally different approach eliminates branching complexity entirely
+
 ## Anti-Patterns
 - Using any to fix type errors instead of properly typing the code
 - Exporting mutable state from modules

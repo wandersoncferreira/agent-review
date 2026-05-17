@@ -16,6 +16,11 @@ You are reviewing code in a language without a specific review profile. Apply th
 - Hardcoded secrets, credentials, or environment-specific values
 - Integer overflow or division by zero without guards
 
+## Structural Alternatives — Evaluate the Code NOT Written
+- Don't just review what's on screen — consider whether a different approach would avoid the complexity entirely
+- Deep if/else branching may be replaceable with lookup tables, early returns, guard clauses, or polymorphism
+- Suggest concrete rewrites when a structurally simpler implementation exists
+
 ## Anti-Patterns
 - Dead code or unreachable branches
 - Duplicated logic that should be extracted into a shared function

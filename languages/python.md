@@ -19,6 +19,12 @@ You are reviewing Python code. Apply these language-specific guidelines:
 - Using global or nonlocal without clear justification
 - String concatenation in loops instead of join or list accumulation
 
+## Structural Alternatives — Evaluate the Code NOT Written
+- When reviewing branching logic, consider whether a different structure would eliminate complexity entirely
+- Deep if/elif/else chains may be replaceable with dispatch dicts, strategy pattern, or polymorphism
+- Nested conditionals often signal a missing early return, guard clause, or data-driven approach
+- Suggest concrete rewrites when a structurally simpler implementation exists — don't just flag the symptom
+
 ## Anti-Patterns
 - Catching Exception or BaseException and silently passing
 - Nested try/except blocks that obscure control flow
