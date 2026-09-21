@@ -69,6 +69,22 @@ built-in prompts shipped with the package."
                  (directory :tag "Custom prompts directory"))
   :group 'agent-review)
 
+(defcustom agent-review-fallback-language "python"
+  "Language prompt to use when detection yields no known language.
+When the agent's language-detection response is not one of
+`agent-review--known-languages' (including the \"other\" answer),
+the review uses this language's prompt file instead.  Set to
+\"other\" to keep the generic prompt."
+  :type '(choice (const "python") (const "clojure")
+                 (const "typescript") (const "other")
+                 (string :tag "Custom language"))
+  :group 'agent-review)
+
+(defcustom agent-review-agent-shell-startup-delay 1.0
+  "Seconds to wait for a newly started agent-shell before inserting text."
+  :type 'number
+  :group 'agent-review)
+
 (defcustom agent-review-enable-codebase-diagnostics t
   "When non-nil, gather git codebase diagnostics before review.
 This runs git log commands to identify churn hotspots, bug clusters,
@@ -111,6 +127,10 @@ Used to track which issues are selected for batch operations.")
 
 (defvar-local agent-review--pr-url nil
   "GitHub PR URL for the current review, when reviewing a PR.")
+
+(defvar-local agent-review--pr-diff-text nil
+  "Cached PR diff text for the current review, when reviewing a PR.
+Used to avoid re-fetching the diff at submission time.")
 
 ;;; Git Integration
 
@@ -191,8 +211,10 @@ Returns a list of username strings.  Results are cached per REPO."
   (let* ((pr-url (agent-review--mention-pr-url))
          (repo (and pr-url (car (agent-review--parse-pr-url pr-url))))
          (contributors (and repo (agent-review--fetch-repo-contributors repo))))
+    (unless pr-url
+      (user-error "Not in a PR buffer; @mention requires a PR context"))
     (unless contributors
-      (user-error "No contributors found for %s" (or repo "unknown repo")))
+      (user-error "No contributors found for %s" repo))
     (let ((login (completing-read "Mention: @" contributors nil t)))
       (insert "@" login))))
 
@@ -258,15 +280,16 @@ body, user (login), created_at.  Returns nil if no comments."
 
 (defun agent-review--get-pr-thread-resolution (pr-url)
   "Fetch review thread resolution status for PR at PR-URL via GraphQL.
-Returns a hash table mapping parent comment databaseId to resolved boolean."
+Returns a hash table mapping parent comment databaseId to resolved
+boolean, or nil when the status could not be fetched."
   (let* ((parsed (agent-review--parse-pr-url pr-url))
          (repo (car parsed))
          (number (cdr parsed))
          (owner (car (split-string repo "/")))
          (name (cadr (split-string repo "/")))
-         (query (format "query {
-  repository(owner: \"%s\", name: \"%s\") {
-    pullRequest(number: %s) {
+         (query "query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
       reviewThreads(first: 100) {
         nodes {
           isResolved
@@ -277,14 +300,21 @@ Returns a hash table mapping parent comment databaseId to resolved boolean."
       }
     }
   }
-}" owner name number))
-         (result (make-hash-table :test 'equal)))
+}"))
     (with-temp-buffer
       (let ((exit-code (call-process "gh" nil t nil
                                      "api" "graphql"
-                                     "-f" (format "query=%s" query))))
-        (when (zerop exit-code)
-          (let* ((json (json-read-from-string (buffer-string)))
+                                     "-f" (format "query=%s" query)
+                                     "-f" (format "owner=%s" owner)
+                                     "-f" (format "name=%s" name)
+                                     "-F" (format "number=%s" number))))
+        (if (not (zerop exit-code))
+            (progn
+              (message "Could not fetch thread resolution status (gh exit %d)"
+                       exit-code)
+              nil)
+          (let* ((result (make-hash-table :test 'equal))
+                 (json (json-read-from-string (buffer-string)))
                  (threads (alist-get 'nodes
                                      (alist-get 'reviewThreads
                                                 (alist-get 'pullRequest
@@ -296,8 +326,8 @@ Returns a hash table mapping parent comment databaseId to resolved boolean."
                      (db-id (and (> (length comments) 0)
                                  (alist-get 'databaseId (aref comments 0)))))
                 (when db-id
-                  (puthash db-id resolved result))))))))
-    result))
+                  (puthash db-id resolved result))))
+            result))))))
 
 (defun agent-review--get-commit-range-diff (commit-range)
   "Get diff for COMMIT-RANGE (e.g. \"abc123..def456\").
@@ -310,53 +340,85 @@ Returns a changes alist with a :commit-diff key."
 
 ;;; Codebase Diagnostics
 
-(defun agent-review--run-git-diagnostic (command)
-  "Run a shell COMMAND for diagnostics, return trimmed output or nil.
+(defun agent-review--run-git-lines (args)
+  "Run git with ARGS (list of strings), return output lines or nil.
 Best-effort: returns nil on any failure."
   (condition-case nil
-      (let ((output (string-trim
-                     (shell-command-to-string command))))
-        (unless (string-empty-p output)
-          output))
+      (with-temp-buffer
+        (when (zerop (apply #'call-process agent-review-git-executable
+                            nil t nil args))
+          (split-string (buffer-string) "\n" t)))
     (error nil)))
+
+(defun agent-review--count-occurrences (lines)
+  "Return alist of (ITEM . COUNT) for distinct items in LINES."
+  (let ((counts (make-hash-table :test 'equal))
+        (result '()))
+    (dolist (line lines)
+      (puthash line (1+ (gethash line counts 0)) counts))
+    (maphash (lambda (item count) (push (cons item count) result)) counts)
+    result))
+
+(defun agent-review--format-counts (pairs)
+  "Format PAIRS of (ITEM . COUNT) as aligned \"COUNT ITEM\" lines, or nil."
+  (when pairs
+    (mapconcat (lambda (pair) (format "%4d %s" (cdr pair) (car pair)))
+               pairs "\n")))
+
+(defun agent-review--top-counted (lines limit)
+  "Count occurrences in LINES, return the LIMIT most frequent as text, or nil."
+  (agent-review--format-counts
+   (seq-take (sort (agent-review--count-occurrences lines)
+                   (lambda (a b) (> (cdr a) (cdr b))))
+             limit)))
 
 (defun agent-review--git-churn-hotspots ()
   "Return the 20 most-changed files in the past year."
-  (agent-review--run-git-diagnostic
-   (format "%s log --format=format: --name-only --since='1 year ago' | sort | uniq -c | sort -nr | head -20"
-           agent-review-git-executable)))
+  (agent-review--top-counted
+   (agent-review--run-git-lines
+    '("log" "--format=format:" "--name-only" "--since=1 year ago"))
+   20))
 
 (defun agent-review--git-contributor-analysis ()
   "Return contributors ranked by commit count in the past 6 months."
-  (agent-review--run-git-diagnostic
-   (format "%s shortlog -sn --no-merges --since='6 months ago'"
-           agent-review-git-executable)))
+  ;; HEAD is required: without a revision, non-interactive `git shortlog'
+  ;; expects log output on stdin and returns nothing.
+  (when-let ((lines (agent-review--run-git-lines
+                     '("shortlog" "-sn" "--no-merges"
+                       "--since=6 months ago" "HEAD"))))
+    (mapconcat #'identity lines "\n")))
 
 (defun agent-review--git-bug-clustering ()
   "Return the 20 files with the most bug-fix related commits."
-  (agent-review--run-git-diagnostic
-   (format "%s log -i -E --grep='fix|bug|broken' --name-only --format='' | sort | uniq -c | sort -nr | head -20"
-           agent-review-git-executable)))
+  (agent-review--top-counted
+   (agent-review--run-git-lines
+    '("log" "-i" "-E" "--grep=fix|bug|broken" "--name-only" "--format="))
+   20))
 
 (defun agent-review--git-development-velocity ()
   "Return monthly commit frequency."
-  (agent-review--run-git-diagnostic
-   (format "%s log --format='%%ad' --date=format:'%%Y-%%m' | sort | uniq -c"
-           agent-review-git-executable)))
+  (agent-review--format-counts
+   (sort (agent-review--count-occurrences
+          (agent-review--run-git-lines
+           '("log" "--format=%ad" "--date=format:%Y-%m")))
+         (lambda (a b) (string< (car a) (car b))))))
 
 (defun agent-review--git-crisis-patterns ()
   "Return revert/hotfix/emergency/rollback commits from the past year."
-  (agent-review--run-git-diagnostic
-   (format "%s log --oneline --since='1 year ago' | grep -iE 'revert|hotfix|emergency|rollback'"
-           agent-review-git-executable)))
+  (when-let* ((lines (agent-review--run-git-lines
+                      '("log" "--oneline" "--since=1 year ago")))
+              (matches (seq-filter
+                        (lambda (line)
+                          (string-match-p "revert\\|hotfix\\|emergency\\|rollback"
+                                          (downcase line)))
+                        lines)))
+    (mapconcat #'identity matches "\n")))
 
 (defun agent-review--gather-codebase-diagnostics ()
   "Gather all codebase diagnostics, return formatted string or nil.
-Only runs when `agent-review-enable-codebase-diagnostics' is non-nil
-and we are in a git repository."
-  (when (and agent-review-enable-codebase-diagnostics
-             (zerop (call-process agent-review-git-executable
-                                  nil nil nil "rev-parse" "--git-dir")))
+Only runs when `agent-review-enable-codebase-diagnostics' is non-nil.
+Each diagnostic is best-effort and yields nil outside a git repository."
+  (when agent-review-enable-codebase-diagnostics
     (let ((sections
            (list
             (cons "Churn Hotspots (most-changed files, past year)"
@@ -430,6 +492,8 @@ Returns a string with each file preceded by a header and numbered lines."
       (setq files (append files (agent-review--changed-files unstaged))))
     (when-let ((commit-diff (alist-get :commit-diff changes)))
       (setq files (append files (agent-review--changed-files commit-diff))))
+    (when-let ((pr-diff (alist-get :pr-diff changes)))
+      (setq files (append files (agent-review--changed-files pr-diff))))
     (setq files (delete-dups files))
     (let ((parts '()))
       (dolist (file files)
@@ -497,7 +561,7 @@ file exists."
   (concat
    (agent-review--load-language-prompt detected-language)
    "\n\n"
-   "Review the following git changes and identify issues.\n\n"
+   "Review the following git changes and identify findings.\n\n"
    "You are given:\n"
    "1. Git diffs showing what changed\n"
    "2. Full file contents with line numbers (each line prefixed with its number, e.g. \"  42: code here\")\n"
@@ -512,24 +576,46 @@ file exists."
    "Don't only review the code as written — also evaluate whether a structurally different\n"
    "implementation would avoid complexity (e.g. deep if/else branches, nested conditionals).\n"
    "When a simpler approach exists (dispatch tables, early returns, guard clauses, polymorphism),\n"
-   "suggest a concrete rewrite as an issue.\n\n"
-   "For each issue, provide:\n"
+   "suggest a concrete rewrite as a suggestion.\n\n"
+   "CONVENTIONAL COMMENTS — choose ONE label per finding:\n"
+   "  issue       — concrete problem (bug, security flaw, broken contract). Default to blocking.\n"
+   "  suggestion  — propose a specific improvement; be explicit about WHAT and WHY.\n"
+   "  nitpick     — trivial, preference-based. ALWAYS non-blocking. Use sparingly.\n"
+   "  question    — genuine ambiguity; you cannot tell if there is a real concern.\n"
+   "  todo        — small, necessary change (rename, missing test name, dead import).\n"
+   "  chore       — process work the author must do (changelog entry, version bump).\n"
+   "  thought     — non-blocking idea worth surfacing for future work.\n"
+   "  note        — non-blocking observation; the reader should be aware.\n"
+   "  praise      — call out something done well. Try to include at least one per review.\n\n"
+   "Choosing the right label IS the directional signal. Do not hedge — if you would normally\n"
+   "write \"this might be...\" decide first whether it is an `issue` (a real problem), a\n"
+   "`suggestion` (you know a better way), or a `question` (you genuinely don't know).\n"
+   "Reach for `nitpick` only for trivial preferences; never for real bugs.\n\n"
+   "DECORATIONS — add in parentheses after the label when blocking-ness is not obvious:\n"
+   "  (blocking)     — must be resolved before merge.\n"
+   "  (non-blocking) — should not prevent merge.\n"
+   "  (if-minor)     — fix only if the change is small.\n"
+   "Examples: `issue(non-blocking)`, `suggestion(blocking)`, `nitpick` (decoration optional).\n\n"
+   "For each finding, provide:\n"
    "- File path (from the diff +++ b/PATH header)\n"
    "- Line number (from the numbered file contents)\n"
-   "- Severity (error/warning/suggestion)\n"
+   "- Label, with optional decoration in parentheses\n"
    "- Short description (max 60 chars, very brief summary)\n"
    "- Diagnostic (full explanation with reasoning, best practice references, and fix guidance. Use markdown formatting.)\n\n"
-   "Format your response as a list where each issue is on its own line in this EXACT format:\n"
-   "FILE:LINE|SEVERITY|SHORT_DESCRIPTION|DIAGNOSTIC\n\n"
+   "Format your response as a list where each finding is on its own line in this EXACT format:\n"
+   "FILE:LINE|LABEL[(DECORATION)]|SHORT_DESCRIPTION|DIAGNOSTIC\n\n"
+   "FILE and LINE are placeholders: replace FILE with the actual file path and LINE\n"
+   "with the actual line number. Do NOT output the literal words \"FILE\" or \"LINE\".\n"
    "The SHORT_DESCRIPTION must be very brief (under 60 characters).\n"
    "The DIAGNOSTIC should be a thorough explanation. Use diagrams if they help illustrate the concept.\n"
-   "Keep each issue on a SINGLE line — do not use literal newlines inside the DIAGNOSTIC field.\n"
+   "Keep each finding on a SINGLE line — do not use literal newlines inside the DIAGNOSTIC field.\n"
    "Use \\n for line breaks within the DIAGNOSTIC field.\n\n"
    "For example:\n"
-   "src/main.el:42|error|Unused variable 'unused-var'|The variable `unused-var` is defined on line 42 but never referenced in the function body.\\nThis is likely a leftover from a refactor. Remove it to keep the code clean.\\n\\n**Best practice**: Run a linter to catch unused bindings automatically.\n"
-   "lib/utils.el:15|warning|Missing docstring|Public function `parse-input` lacks a docstring.\\nAll public API functions should document their parameters and return values.\\n\\n**Fix Suggestion**: Add a docstring describing the expected input format and return type.\n"
-   "tests/test.el:8|suggestion|Add edge case test|The test suite covers the happy path but misses boundary conditions.\\nConsider adding tests for empty input, nil values, and maximum-length strings.\n\n"
-   "Only output the issue lines, no other commentary.\n\n"
+   "src/cache.py:42|issue(blocking)|Race in cache reload|Two concurrent requests can both pass the `is_stale` check and both rebuild, dropping one's writes.\\nUse a `ContextVar` or a per-key `asyncio.Lock` to serialize reloads.\\n\\n**Fix**: wrap the reload in `async with self._locks[key]:`.\n"
+   "src/cache.py:88|suggestion|Replace branch chain with dispatch dict|The 4-way `if event_type ==` chain at lines 88-104 will keep growing.\\nReplace with a `_HANDLERS: dict[str, Callable]` keyed on event_type and dispatch with `_HANDLERS[event_type](payload)`.\n"
+   "lib/utils.py:15|nitpick|Prefer f-string over .format()|`\"{}\".format(x)` reads less directly than `f\"{x}\"` and the codebase otherwise uses f-strings.\n"
+   "src/api.py:120|praise|Nice extraction of the validator|Pulling validation into a pure function makes both endpoints testable in isolation. Keep doing this.\n\n"
+   "Only output the finding lines, no other commentary.\n\n"
    "Git changes:\n\n"
    (agent-review--format-changes-for-prompt changes)))
 
@@ -541,7 +627,8 @@ file exists."
 
 (defun agent-review--ignored-file-p (filename)
   "Return non-nil if FILENAME should be ignored for language detection.
-Ignores dotfiles, and files with extensions in `agent-review--ignored-extensions'."
+Ignores dotfiles, and files with extensions in
+`agent-review--ignored-extensions'."
   (let ((base (file-name-nondirectory filename)))
     (or (string-prefix-p "." base)
         (member (file-name-extension base) agent-review--ignored-extensions))))
@@ -577,13 +664,14 @@ per file, filtering out ignored files."
 
 (defun agent-review--make-language-detection-prompt (changes)
   "Create a prompt to detect the programming language from CHANGES.
-Sends only file paths and a small code sample to keep the request fast."
-  (let* ((staged-sample (agent-review--extract-diff-sample
-                         (alist-get :staged changes)))
-         (unstaged-sample (agent-review--extract-diff-sample
-                           (alist-get :unstaged changes)))
-         (sample (string-trim
-                  (concat (or staged-sample "") "\n" (or unstaged-sample "")))))
+Samples every diff source (staged, unstaged, PR, commit range) and
+sends only file paths and a small code sample to keep the request fast."
+  (let* ((samples (delq nil
+                        (mapcar (lambda (key)
+                                  (agent-review--extract-diff-sample
+                                   (alist-get key changes)))
+                                '(:staged :unstaged :pr-diff :commit-diff))))
+         (sample (string-trim (mapconcat #'identity samples "\n"))))
     (concat
      "Identify the primary programming language used in these code changes.\n"
      "You MUST respond with exactly one word, no punctuation, no explanation.\n"
@@ -594,11 +682,13 @@ Sends only file paths and a small code sample to keep the request fast."
 
 (defun agent-review--parse-language-response (response-text)
   "Parse RESPONSE-TEXT into a known language string.
-Returns one of \"python\", \"clojure\", \"typescript\", or \"other\"."
+Returns one of `agent-review--known-languages', or
+`agent-review-fallback-language' when the response does not
+match any of them."
   (let ((lang (downcase (string-trim response-text))))
     (if (member lang agent-review--known-languages)
         lang
-      "other")))
+      agent-review-fallback-language)))
 
 (defvar-local agent-review--session-client nil
   "Current review session's ACP client.")
@@ -717,225 +807,183 @@ Returns the created buffer."
             agent-review--session-id nil
             agent-review--session-response-text nil))))
 
+(cl-defun agent-review--acp-start-session (&key config buffer-name on-status on-ready on-error)
+  "Create an ACP client, initialize it, and open a session.
+CONFIG is an agent-shell agent configuration.  BUFFER-NAME names the
+hidden work buffer.  ON-STATUS, when non-nil, is called with progress
+phase strings.  ON-READY is called with (WORK-BUFFER CLIENT SESSION-ID)
+once the session exists.  ON-ERROR is called with a descriptive string;
+the work buffer is already cleaned up by then.  Streamed agent output
+accumulates in the work buffer's `agent-review--session-response-text'."
+  (let* ((work-buffer (generate-new-buffer buffer-name))
+         (cwd default-directory)
+         (client nil)
+         (fail (lambda (msg)
+                 (agent-review--cleanup-session work-buffer)
+                 (when (buffer-live-p work-buffer)
+                   (kill-buffer work-buffer))
+                 (funcall on-error msg))))
+    (with-current-buffer work-buffer
+      (setq agent-review--session-response-text "")
+      (setq client (funcall (alist-get :client-maker config) work-buffer))
+      (setq agent-review--session-client client)
+      ;; Subscribe to notifications to capture streamed agent output
+      (acp-subscribe-to-notifications
+       :client client
+       :buffer work-buffer
+       :on-notification
+       (lambda (notification)
+         (when (buffer-live-p work-buffer)
+           (with-current-buffer work-buffer
+             (let-alist notification
+               (when (equal .method "session/update")
+                 (let ((update (alist-get 'update .params)))
+                   (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
+                     (let-alist update
+                       (setq agent-review--session-response-text
+                             (concat agent-review--session-response-text .content.text)))))))))))
+      (acp-subscribe-to-errors
+       :client client
+       :buffer work-buffer
+       :on-error
+       (lambda (err)
+         (let ((response (and (buffer-live-p work-buffer)
+                              (buffer-local-value 'agent-review--session-response-text
+                                                  work-buffer))))
+           (funcall fail
+                    (format "Agent error: %S%s" err
+                            (if (and response (not (string-empty-p response)))
+                                (format "\nPartial response:\n%s"
+                                        (string-trim response))
+                              ""))))))
+      (when on-status (funcall on-status "Handshaking with agent..."))
+      (acp-send-request
+       :client client
+       :sync nil
+       :request (acp-make-initialize-request
+                 :protocol-version 1
+                 :read-text-file-capability nil
+                 :write-text-file-capability nil)
+       :on-success
+       (lambda (_result)
+         (when (buffer-live-p work-buffer)
+           (when on-status (funcall on-status "Creating session..."))
+           (acp-send-request
+            :client client
+            :sync nil
+            :request (acp-make-session-new-request
+                      :cwd cwd
+                      :mcp-servers [])
+            :on-success
+            (lambda (session-response)
+              (when (buffer-live-p work-buffer)
+                (let ((session-id (alist-get 'sessionId session-response)))
+                  (with-current-buffer work-buffer
+                    (setq agent-review--session-id session-id))
+                  (funcall on-ready work-buffer client session-id))))
+            :on-failure
+            (lambda (err)
+              (funcall fail (format "Session creation failed: %S" err))))))
+       :on-failure
+       (lambda (err)
+         (funcall fail (format "Initialization failed: %S" err)))))))
+
+(cl-defun agent-review--acp-send-prompt (&key work-buffer client session-id text on-success on-error)
+  "Send TEXT as a prompt on SESSION-ID and collect the streamed response.
+WORK-BUFFER and CLIENT come from `agent-review--acp-start-session'.
+Resets the response accumulator first.  ON-SUCCESS is called with the
+accumulated response text; the session stays open so further prompts can
+be sent.  ON-ERROR is called with the raw error after the session has
+been cleaned up."
+  (with-current-buffer work-buffer
+    (setq agent-review--session-response-text "")
+    (acp-send-request
+     :client client
+     :sync nil
+     :request (acp-make-session-prompt-request
+               :session-id session-id
+               :prompt (vector (list (cons 'type "text")
+                                     (cons 'text text))))
+     :on-success
+     (lambda (_result)
+       (when (buffer-live-p work-buffer)
+         (funcall on-success
+                  (buffer-local-value 'agent-review--session-response-text
+                                      work-buffer))))
+     :on-failure
+     (lambda (err)
+       (agent-review--cleanup-session work-buffer)
+       (when (buffer-live-p work-buffer)
+         (kill-buffer work-buffer))
+       (funcall on-error err)))))
+
 (defun agent-review--request-review-async (changes config status-buffer on-complete)
   "Send CHANGES to agent using CONFIG and call ON-COMPLETE when done.
 STATUS-BUFFER is the buffer to update with progress information.
 ON-COMPLETE is called with (response-text detected-language error)
 where error is nil on success.  The review runs in two turns:
 first detecting the programming language, then sending the review prompt."
-  (let* ((work-buffer (generate-new-buffer " *agent-review-work*"))
-         (client nil)
-         (session-id nil))
-    
-    (with-current-buffer work-buffer
-      (setq agent-review--session-response-text "")
-      
-      ;; Create client
-      (setq client (funcall (alist-get :client-maker config) work-buffer))
-      (setq agent-review--session-client client)
-      
-      ;; Subscribe to notifications to capture agent output
-      (acp-subscribe-to-notifications
-       :client client
-       :buffer work-buffer
-       :on-notification
-       (lambda (notification)
-         (when (buffer-live-p work-buffer)
-           (with-current-buffer work-buffer
-             (let-alist notification
-               (when (equal .method "session/update")
-                 (let ((update (alist-get 'update .params)))
-                   (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
-                     (let-alist update
-                       (setq agent-review--session-response-text
-                             (concat agent-review--session-response-text .content.text)))))))))))
-      
-      ;; Subscribe to errors
-      (acp-subscribe-to-errors
-       :client client
-       :buffer work-buffer
-       :on-error
-       (lambda (err)
-         (let ((response agent-review--session-response-text))
-           (agent-review--cleanup-session work-buffer)
-           (kill-buffer work-buffer)
-           (funcall on-complete nil nil (format "Agent error: %S" err)))))
-      
-      ;; Initialize (async)
-      (agent-review--update-status-buffer status-buffer "Handshaking with agent...")
-      (message "Handshaking with agent...")
-      (acp-send-request
-       :client client
-       :sync nil
-       :request (acp-make-initialize-request
-                 :protocol-version 1
-                 :read-text-file-capability nil
-                 :write-text-file-capability nil)
-       :on-success
-       (lambda (_result)
-         (when (buffer-live-p work-buffer)
-           ;; Create session (async)
-           (agent-review--update-status-buffer status-buffer "Creating session...")
-           (message "Creating session...")
-           (acp-send-request
-            :client client
-            :sync nil
-            :request (acp-make-session-new-request
-                      :cwd default-directory
-                      :mcp-servers [])
-            :on-success
-            (lambda (session-response)
-              (when (buffer-live-p work-buffer)
-                (with-current-buffer work-buffer
-                  (setq session-id (alist-get 'sessionId session-response))
-                  (setq agent-review--session-id session-id)
-                  
-                  ;; Turn 1: detect programming language
-                  (agent-review--update-status-buffer status-buffer "Detecting language...")
-                  (message "Detecting programming language...")
-                  (acp-send-request
-                   :client client
-                   :sync nil
-                   :request (acp-make-session-prompt-request
-                             :session-id session-id
-                             :prompt (vector (list (cons 'type "text")
-                                                   (cons 'text (agent-review--make-language-detection-prompt changes)))))
-                   :on-success
-                   (lambda (_result)
-                     (when (buffer-live-p work-buffer)
-                       (let ((detected-language
-                              (with-current-buffer work-buffer
-                                (agent-review--parse-language-response
-                                 agent-review--session-response-text))))
-                         ;; Reset accumulated text for turn 2
-                         (with-current-buffer work-buffer
-                           (setq agent-review--session-response-text ""))
-                         ;; Turn 2: send review prompt
-                         (agent-review--update-status-buffer
-                          status-buffer (format "Reviewing %s code..." detected-language))
-                         (message "Language: %s — sending review request..." detected-language)
-                         (acp-send-request
-                          :client client
-                          :sync nil
-                          :request (acp-make-session-prompt-request
-                                    :session-id session-id
-                                    :prompt (vector (list (cons 'type "text")
-                                                          (cons 'text (agent-review--make-review-prompt changes detected-language)))))
-                          :on-success
-                          (lambda (_result)
-                            (when (buffer-live-p work-buffer)
-                              (let ((response (with-current-buffer work-buffer
-                                                agent-review--session-response-text)))
-                                (agent-review--cleanup-session work-buffer)
-                                (kill-buffer work-buffer)
-                                (funcall on-complete response detected-language nil))))
-                          :on-failure
-                          (lambda (err)
-                            (agent-review--cleanup-session work-buffer)
-                            (kill-buffer work-buffer)
-                            (funcall on-complete nil nil (format "Review request failed: %S" err)))))))
-                   :on-failure
-                   (lambda (err)
-                     (agent-review--cleanup-session work-buffer)
-                     (kill-buffer work-buffer)
-                     (funcall on-complete nil nil (format "Language detection failed: %S" err)))))))
-            :on-failure
-            (lambda (err)
-              (agent-review--cleanup-session work-buffer)
-              (kill-buffer work-buffer)
-              (funcall on-complete nil nil (format "Session creation failed: %S" err))))))
-       :on-failure
-       (lambda (err)
-         (agent-review--cleanup-session work-buffer)
-         (kill-buffer work-buffer)
-         (funcall on-complete nil nil (format "Initialization failed: %S" err)))))))
-
+  (agent-review--acp-start-session
+   :config config
+   :buffer-name " *agent-review-work*"
+   :on-status (lambda (status)
+                (agent-review--update-status-buffer status-buffer status)
+                (message "%s" status))
+   :on-error (lambda (msg) (funcall on-complete nil nil msg))
+   :on-ready
+   (lambda (work-buffer client session-id)
+     ;; Turn 1: detect programming language
+     (agent-review--update-status-buffer status-buffer "Detecting language...")
+     (message "Detecting programming language...")
+     (agent-review--acp-send-prompt
+      :work-buffer work-buffer :client client :session-id session-id
+      :text (agent-review--make-language-detection-prompt changes)
+      :on-error
+      (lambda (err)
+        (funcall on-complete nil nil (format "Language detection failed: %S" err)))
+      :on-success
+      (lambda (response)
+        (let ((detected-language (agent-review--parse-language-response response)))
+          ;; Turn 2: send review prompt
+          (agent-review--update-status-buffer
+           status-buffer (format "Reviewing %s code..." detected-language))
+          (message "Language: %s — sending review request..." detected-language)
+          (agent-review--acp-send-prompt
+           :work-buffer work-buffer :client client :session-id session-id
+           ;; Build the prompt in the work buffer so relative file paths
+           ;; resolve against the project directory.
+           :text (with-current-buffer work-buffer
+                   (agent-review--make-review-prompt changes detected-language))
+           :on-error
+           (lambda (err)
+             (funcall on-complete nil nil (format "Review request failed: %S" err)))
+           :on-success
+           (lambda (review-response)
+             (agent-review--cleanup-session work-buffer)
+             (kill-buffer work-buffer)
+             (funcall on-complete review-response detected-language nil)))))))))
 
 (defun agent-review--request-prompt-async (prompt-text config on-complete)
   "Send PROMPT-TEXT to agent using CONFIG and call ON-COMPLETE when done.
 ON-COMPLETE is called with (response-text error) where error is nil on success.
 This is a single-turn prompt without language detection."
-  (let* ((work-buffer (generate-new-buffer " *agent-review-prompt-work*"))
-         (client nil)
-         (session-id nil))
-    (with-current-buffer work-buffer
-      (setq agent-review--session-response-text "")
-      (setq client (funcall (alist-get :client-maker config) work-buffer))
-      (setq agent-review--session-client client)
-      (acp-subscribe-to-notifications
-       :client client
-       :buffer work-buffer
-       :on-notification
-       (lambda (notification)
-         (when (buffer-live-p work-buffer)
-           (with-current-buffer work-buffer
-             (let-alist notification
-               (when (equal .method "session/update")
-                 (let ((update (alist-get 'update .params)))
-                   (when (equal (alist-get 'sessionUpdate update) "agent_message_chunk")
-                     (let-alist update
-                       (setq agent-review--session-response-text
-                             (concat agent-review--session-response-text .content.text)))))))))))
-      (acp-subscribe-to-errors
-       :client client
-       :buffer work-buffer
-       :on-error
-       (lambda (err)
-         (agent-review--cleanup-session work-buffer)
-         (kill-buffer work-buffer)
-         (funcall on-complete nil (format "Agent error: %S" err))))
-      (acp-send-request
-       :client client
-       :sync nil
-       :request (acp-make-initialize-request
-                 :protocol-version 1
-                 :read-text-file-capability nil
-                 :write-text-file-capability nil)
-       :on-success
-       (lambda (_result)
-         (when (buffer-live-p work-buffer)
-           (acp-send-request
-            :client client
-            :sync nil
-            :request (acp-make-session-new-request
-                      :cwd default-directory
-                      :mcp-servers [])
-            :on-success
-            (lambda (session-response)
-              (when (buffer-live-p work-buffer)
-                (with-current-buffer work-buffer
-                  (setq session-id (alist-get 'sessionId session-response))
-                  (setq agent-review--session-id session-id)
-                  (acp-send-request
-                   :client client
-                   :sync nil
-                   :request (acp-make-session-prompt-request
-                             :session-id session-id
-                             :prompt (vector (list (cons 'type "text")
-                                                   (cons 'text prompt-text))))
-                   :on-success
-                   (lambda (_result)
-                     (when (buffer-live-p work-buffer)
-                       (let ((response (with-current-buffer work-buffer
-                                         agent-review--session-response-text)))
-                         (agent-review--cleanup-session work-buffer)
-                         (kill-buffer work-buffer)
-                         (funcall on-complete response nil))))
-                   :on-failure
-                   (lambda (err)
-                     (agent-review--cleanup-session work-buffer)
-                     (kill-buffer work-buffer)
-                     (funcall on-complete nil (format "Prompt failed: %S" err)))))))
-            :on-failure
-            (lambda (err)
-              (agent-review--cleanup-session work-buffer)
-              (kill-buffer work-buffer)
-              (funcall on-complete nil (format "Session creation failed: %S" err))))))
-       :on-failure
-       (lambda (err)
-         (agent-review--cleanup-session work-buffer)
-         (kill-buffer work-buffer)
-         (funcall on-complete nil (format "Initialization failed: %S" err)))))))
+  (agent-review--acp-start-session
+   :config config
+   :buffer-name " *agent-review-prompt-work*"
+   :on-error (lambda (msg) (funcall on-complete nil msg))
+   :on-ready
+   (lambda (work-buffer client session-id)
+     (agent-review--acp-send-prompt
+      :work-buffer work-buffer :client client :session-id session-id
+      :text prompt-text
+      :on-error
+      (lambda (err)
+        (funcall on-complete nil (format "Prompt failed: %S" err)))
+      :on-success
+      (lambda (response)
+        (agent-review--cleanup-session work-buffer)
+        (kill-buffer work-buffer)
+        (funcall on-complete response nil))))))
 
 
 ;;; Response Parser
@@ -944,29 +992,66 @@ This is a single-turn prompt without language detection."
   "Unescape literal \\n sequences in TEXT to actual newlines."
   (replace-regexp-in-string "\\\\n" "\n" text))
 
+(defconst agent-review--label-set
+  '("issue" "suggestion" "nitpick" "question" "praise"
+    "todo" "chore" "thought" "note")
+  "Conventional Comments labels recognized by the parser.
+See https://conventionalcomments.org/#labels for definitions.")
+
 (defun agent-review--parse-issue-line (line)
   "Parse a single issue LINE.
-Returns plist with :file :line :severity :short-description :diagnostic
-or nil if invalid.  The format is FILE:LINE|SEVERITY|SHORT_DESCRIPTION|DIAGNOSTIC."
-  (when (string-match "^\\(.+?\\):\\([0-9]+\\)|\\(error\\|warning\\|suggestion\\)|\\([^|]+\\)|\\(.+\\)$" line)
+Returns plist with :file :line :label :decoration :short-description
+:diagnostic, or nil if invalid.  The expected format is
+FILE:LINE|LABEL[(DECORATION)]|SHORT_DESCRIPTION|DIAGNOSTIC."
+  (when (string-match
+         ;; Tolerate agents that echo the literal "FILE:" placeholder
+         ;; from the format spec before the actual path.
+         (concat "^\\(?:FILE:\\)?\\(.+?\\):\\([0-9]+\\)|"
+                 "\\(issue\\|suggestion\\|nitpick\\|question\\|praise"
+                 "\\|todo\\|chore\\|thought\\|note\\)"
+                 "\\(?:(\\([^)]+\\))\\)?"
+                 "|\\([^|]+\\)|\\(.+\\)$")
+         line)
     (list :file (match-string 1 line)
           :line (string-to-number (match-string 2 line))
-          :severity (match-string 3 line)
-          :short-description (string-trim (match-string 4 line))
+          :label (match-string 3 line)
+          :decoration (when (match-string 4 line)
+                        (string-trim (match-string 4 line)))
+          :short-description (string-trim (match-string 5 line))
           :diagnostic (agent-review--unescape-diagnostic
-                       (string-trim (match-string 5 line))))))
+                       (string-trim (match-string 6 line))))))
 
-(defun agent-review--severity-priority (severity)
-  "Return numeric priority for SEVERITY (lower is higher priority)."
-  (pcase severity
-    ("error" 1)
-    ("warning" 2)
-    ("suggestion" 3)
-    (_ 4)))
+(defun agent-review--label-priority (label)
+  "Return numeric priority for LABEL (lower is higher priority).
+Blocking-by-default labels rank above optional ones."
+  (pcase label
+    ("issue"      1)
+    ("chore"      2)
+    ("todo"       3)
+    ("suggestion" 4)
+    ("question"   5)
+    ("nitpick"    6)
+    ("thought"    7)
+    ("note"       8)
+    ("praise"     9)
+    (_           10)))
+
+(defun agent-review--issue-priority (issue)
+  "Combined priority for ISSUE: label rank, adjusted by decoration.
+\"(blocking)\" pulls the rank up by 0.5, \"(non-blocking)\" pushes it down."
+  (let ((base (agent-review--label-priority (plist-get issue :label)))
+        (dec  (plist-get issue :decoration)))
+    (cond
+     ((and dec (string-match-p "\\bblocking\\b" dec)
+           (not (string-match-p "non-blocking" dec)))
+      (- base 0.5))
+     ((and dec (string-match-p "non-blocking" dec))
+      (+ base 0.5))
+     (t base))))
 
 (defun agent-review--parse-issues (response-text)
   "Parse agent RESPONSE-TEXT into structured issue list.
-Returns list of issue plists sorted by file, then severity."
+Returns list of issue plists sorted by file, then label priority."
   (let ((lines (split-string response-text "\n" t))
         (issues '()))
     (dolist (line lines)
@@ -977,21 +1062,31 @@ Returns list of issue plists sorted by file, then severity."
             (let ((file-a (plist-get a :file))
                   (file-b (plist-get b :file)))
               (if (string= file-a file-b)
-                  ;; Same file, sort by severity
-                  (< (agent-review--severity-priority (plist-get a :severity))
-                     (agent-review--severity-priority (plist-get b :severity)))
+                  ;; Same file, sort by label priority
+                  (< (agent-review--issue-priority a)
+                     (agent-review--issue-priority b))
                 ;; Different files, sort alphabetically
                 (string< file-a file-b)))))))
 
 ;;; Display Interface
 
-(defun agent-review--severity-face (severity)
-  "Return face for SEVERITY level."
-  (pcase severity
-    ("error" 'compilation-error)
-    ("warning" 'compilation-warning)
-    ("suggestion" 'compilation-info)
-    (_ 'default)))
+(defun agent-review--label-face (label)
+  "Return face for Conventional Comments LABEL."
+  (pcase label
+    ("issue"                       'compilation-error)
+    ((or "chore" "todo")           'compilation-warning)
+    ((or "suggestion" "question")  'compilation-info)
+    ((or "nitpick" "thought" "note") 'shadow)
+    ("praise"                      'success)
+    (_                             'default)))
+
+(defun agent-review--label-display (issue)
+  "Return display string for ISSUE's label, with decoration suffix if present."
+  (let ((label (plist-get issue :label))
+        (dec   (plist-get issue :decoration)))
+    (if (and dec (not (string-empty-p dec)))
+        (format "%s(%s)" label dec)
+      label)))
 
 (defun agent-review--issue-marked-p (issue)
   "Return non-nil if ISSUE is marked."
@@ -1003,9 +1098,9 @@ Returns list of issue plists sorted by file, then severity."
   (list issue
         (vector
          (if (agent-review--issue-marked-p issue) "*" " ")
-         (propertize (plist-get issue :severity)
-                     'font-lock-face (agent-review--severity-face
-                                      (plist-get issue :severity)))
+         (propertize (agent-review--label-display issue)
+                     'font-lock-face (agent-review--label-face
+                                      (plist-get issue :label)))
          (plist-get issue :file)
          (propertize (format "%5d" (plist-get issue :line))
                      'font-lock-face 'line-number)
@@ -1015,7 +1110,7 @@ Returns list of issue plists sorted by file, then severity."
   "Jump to the issue at point."
   (interactive)
   (when-let* ((issue (tabulated-list-get-id))
-              (file (plist-get issue :file))
+              (file (string-remove-prefix "FILE:" (plist-get issue :file)))
               (line (plist-get issue :line)))
     (if (file-exists-p file)
         (progn
@@ -1119,7 +1214,7 @@ Removes them from the review buffer."
   (format "%s:%d [%s] %s\n\nDiagnostic:\n%s"
           (plist-get issue :file)
           (plist-get issue :line)
-          (upcase (plist-get issue :severity))
+          (upcase (agent-review--label-display issue))
           (plist-get issue :short-description)
           (plist-get issue :diagnostic)))
 
@@ -1139,6 +1234,36 @@ implementing fixes."
                    (if (= (length issues) 1) "" "s")))
       (message "No issues to copy"))))
 
+(defun agent-review--send-to-agent-shell (text)
+  "Insert TEXT into the project's agent-shell, starting one if needed.
+When no shell exists, offers to start one and retries after
+`agent-review-agent-shell-startup-delay' seconds to let it initialize.
+Returns `sent' when inserted directly, `queued' when a shell was
+started and the insert is pending, or nil when the user cancelled."
+  (condition-case nil
+      (progn
+        (agent-shell-insert :text text)
+        'sent)
+    (error
+     (if (y-or-n-p "No agent shell found. Start one? ")
+         (progn
+           (agent-shell-start :config (agent-shell-select-config
+                                       :prompt "Select agent: "))
+           ;; agent-shell-start offers no ready callback; give the shell
+           ;; a moment to initialize before inserting.
+           (run-with-timer agent-review-agent-shell-startup-delay nil
+                           (lambda (queued-text)
+                             (condition-case err
+                                 (agent-shell-insert :text queued-text)
+                               (error
+                                (message "Failed to send to agent-shell: %s"
+                                         (error-message-string err)))))
+                           text)
+           'queued)
+       (progn
+         (message "Cancelled")
+         nil)))))
+
 (defun agent-review-send-to-agent-shell ()
   "Send marked issues (or issue at point) to agent-shell for implementation.
 If no agent-shell is open in the current project, starts a new one."
@@ -1150,39 +1275,21 @@ If no agent-shell is open in the current project, starts a new one."
                                        issues
                                        "\n"))
                (full-text (concat prompt-header issues-text "\n")))
-          ;; Check if an agent-shell exists, if not start one
-          (condition-case err
-              (progn
-                (agent-shell-insert :text full-text)
-                (message "Sent %d issue%s to agent-shell"
-                         (length issues)
-                         (if (= (length issues) 1) "" "s")))
-            (error
-             ;; No agent-shell available, start one and try again
-             (if (y-or-n-p "No agent shell found. Start one? ")
-                 (progn
-                   (agent-shell-start :config (agent-shell-select-config
-                                               :prompt "Select agent: "))
-                   ;; Wait a moment for shell to initialize, then insert
-                   (run-with-timer 1.0 nil
-                                   (lambda (text)
-                                     (condition-case err2
-                                         (agent-shell-insert :text text)
-                                       (error
-                                        (message "Failed to send to agent-shell: %s" (error-message-string err2)))))
-                                   full-text))
-               (message "Cancelled")))))
+          (when (eq (agent-review--send-to-agent-shell full-text) 'sent)
+            (message "Sent %d issue%s to agent-shell"
+                     (length issues)
+                     (if (= (length issues) 1) "" "s"))))
       (message "No issues to send"))))
 
 ;;; GitHub Integration
 
 (defun agent-review--format-issue-as-gh-body (issue)
   "Format ISSUE plist into a GitHub issue markdown body."
-  (format "## %s\n\n**File:** `%s:%d`\n**Severity:** %s\n\n### Diagnostic\n\n%s\n\n---\n*Generated by agent-review.el*"
+  (format "## %s\n\n**File:** `%s:%d`\n**Type:** %s\n\n### Diagnostic\n\n%s\n\n---\n*Generated by agent-review.el*"
           (plist-get issue :short-description)
           (plist-get issue :file)
           (plist-get issue :line)
-          (upcase (plist-get issue :severity))
+          (agent-review--label-display issue)
           (plist-get issue :diagnostic)))
 
 (defun agent-review--format-issues-as-gh-body (issues)
@@ -1192,12 +1299,12 @@ If no agent-shell is open in the current project, starts a new one."
                   for i from 1
                   collect (format "### %d. [%s] %s\n\n**File:** `%s:%d`\n\n%s"
                                   i
-                                  (upcase (plist-get issue :severity))
+                                  (agent-review--label-display issue)
                                   (plist-get issue :short-description)
                                   (plist-get issue :file)
                                   (plist-get issue :line)
                                   (plist-get issue :diagnostic)))))
-    (concat (format "## Code review: %d issues\n\n" (length issues))
+    (concat (format "## Code review: %d findings\n\n" (length issues))
             (mapconcat #'identity sections "\n\n")
             "\n\n---\n*Generated by agent-review.el*")))
 
@@ -1230,11 +1337,11 @@ Uses the gh CLI to create the issue in the current repository."
              (title (if single-p
                         (let ((issue (car issues)))
                           (format "[%s] %s (%s:%d)"
-                                  (upcase (plist-get issue :severity))
+                                  (agent-review--label-display issue)
                                   (plist-get issue :short-description)
                                   (plist-get issue :file)
                                   (plist-get issue :line)))
-                      (format "Code review: %d issues found" (length issues))))
+                      (format "Code review: %d findings" (length issues))))
              (body (if single-p
                        (agent-review--format-issue-as-gh-body (car issues))
                      (agent-review--format-issues-as-gh-body issues)))
@@ -1245,9 +1352,11 @@ Uses the gh CLI to create the issue in the current repository."
 ;;; GitHub PR Review
 
 (defun agent-review--format-pr-review-comment-body (issue)
-  "Format the body text for a PR review comment from ISSUE."
-  (format "**[%s]** %s\n\n%s"
-          (upcase (plist-get issue :severity))
+  "Format the body text for a PR review comment from ISSUE.
+Follows the Conventional Comments spec: `**label(decoration):** subject`.
+See https://conventionalcomments.org."
+  (format "**%s:** %s\n\n%s"
+          (agent-review--label-display issue)
           (plist-get issue :short-description)
           (plist-get issue :diagnostic)))
 
@@ -1315,20 +1424,26 @@ OVERFLOW comments reference lines outside the diff and must go in the body."
    overflow
    "\n\n---\n\n"))
 
-(cl-defun agent-review--gh-submit-pr-review (&key pr-url event comments body)
+(cl-defun agent-review--gh-submit-pr-review (&key pr-url event comments body diff-text)
   "Submit a GitHub PR review with line-level COMMENTS.
 PR-URL is the GitHub pull request URL.
 EVENT is the review event: \"COMMENT\", \"REQUEST_CHANGES\", or \"APPROVE\".
 COMMENTS is a list of comment alists with path, line, and body keys.
 BODY is the review body text.  When nil, a default is generated.
+DIFF-TEXT is the PR diff; when nil (and COMMENTS is non-nil) it is
+fetched via the gh CLI.
 Comments on lines outside the diff are moved into the review body."
   (unless (executable-find "gh")
     (user-error "gh CLI not found.  Install it from https://cli.github.com"))
   (let* ((parsed (agent-review--parse-pr-url pr-url))
          (repo (car parsed))
          (number (cdr parsed))
-         (diff-text (cdr (assq :pr-diff (agent-review--get-pr-diff pr-url))))
-         (partitioned (agent-review--partition-comments-by-diff comments diff-text))
+         (diff-text (and comments
+                         (or diff-text
+                             (cdr (assq :pr-diff (agent-review--get-pr-diff pr-url))))))
+         (partitioned (if comments
+                          (agent-review--partition-comments-by-diff comments diff-text)
+                        (cons nil nil)))
          (inline (car partitioned))
          (overflow (cdr partitioned))
          (review-body (or body
@@ -1385,10 +1500,11 @@ Comments on lines outside the diff are moved into the review body."
         (error "Failed to get PR head SHA (exit %d): %s"
                exit-code (string-trim (buffer-string)))))))
 
-(cl-defun agent-review--gh-submit-standalone-comments (&key pr-url comments)
+(cl-defun agent-review--gh-submit-standalone-comments (&key pr-url comments diff-text)
   "Post each comment in COMMENTS as a standalone PR comment.
 PR-URL is the GitHub pull request URL.
 COMMENTS is a list of comment alists with path, line, and body keys.
+DIFF-TEXT is the PR diff; when nil it is fetched via the gh CLI.
 Comments on lines outside the diff are skipped with a warning.
 Returns the PR URL."
   (unless (executable-find "gh")
@@ -1397,7 +1513,8 @@ Returns the PR URL."
          (repo (car parsed))
          (number (cdr parsed))
          (commit-id (agent-review--gh-get-pr-head-sha repo number))
-         (diff-text (cdr (assq :pr-diff (agent-review--get-pr-diff pr-url))))
+         (diff-text (or diff-text
+                        (cdr (assq :pr-diff (agent-review--get-pr-diff pr-url)))))
          (partitioned (agent-review--partition-comments-by-diff comments diff-text))
          (inline (car partitioned))
          (overflow (cdr partitioned))
@@ -1477,8 +1594,9 @@ Returns the PR URL."
 \\[agent-review-edit-comment-confirm] to confirm and advance to next issue.
 \\[agent-review-edit-comment-abort] to abort the entire review submission.")
 
-(evil-define-key* '(normal insert) agent-review-edit-comment-mode-map
-  (kbd "C-c m") #'agent-review-mention)
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal insert) agent-review-edit-comment-mode-map
+    (kbd "C-c m") #'agent-review-mention))
 
 (defun agent-review--edit-comment-header (issue index total)
   "Return a read-only header string for ISSUE at INDEX of TOTAL."
@@ -1487,7 +1605,7 @@ Returns the PR URL."
            index total
            (plist-get issue :file)
            (plist-get issue :line)
-           (upcase (plist-get issue :severity)))
+           (agent-review--label-display issue))
    'face 'font-lock-comment-face
    'read-only t
    'front-sticky '(read-only)
@@ -1497,8 +1615,8 @@ Returns the PR URL."
   "Show edit buffer for ISSUE.
 REMAINING is the list of issues still to edit.
 COLLECTED is the list of comment alists already confirmed.
-PR-URL, EVENT, SUBMIT-MODE, and REVIEW-BUFFER are forwarded for final submission.
-SUBMIT-MODE is `review' or `standalone'.
+PR-URL, EVENT, SUBMIT-MODE, and REVIEW-BUFFER are forwarded for
+final submission.  SUBMIT-MODE is `review' or `standalone'.
 INDEX and TOTAL are for the progress header."
   (let ((buffer (get-buffer-create "*Agent Review Comment*")))
     (with-current-buffer buffer
@@ -1617,7 +1735,11 @@ PR-URL, EVENT, SUBMIT-MODE, and REVIEW-BUFFER are for final submission."
          (collected agent-review--edit-body-collected)
          (pr-url agent-review--edit-body-pr-url)
          (event agent-review--edit-body-event)
-         (submit-mode agent-review--edit-body-submit-mode))
+         (submit-mode agent-review--edit-body-submit-mode)
+         (review-buffer agent-review--edit-body-review-buffer)
+         (diff-text (and (buffer-live-p review-buffer)
+                         (buffer-local-value 'agent-review--pr-diff-text
+                                             review-buffer))))
     (quit-window t)
     (pcase submit-mode
       ('review
@@ -1632,7 +1754,8 @@ PR-URL, EVENT, SUBMIT-MODE, and REVIEW-BUFFER are for final submission."
                      :pr-url pr-url
                      :event event
                      :comments collected
-                     :body body)))
+                     :body body
+                     :diff-text diff-text)))
            (when (string= event "APPROVE")
              (agent-review--blind-approve-record pr-url))
            (kill-new url)
@@ -1643,7 +1766,8 @@ PR-URL, EVENT, SUBMIT-MODE, and REVIEW-BUFFER are for final submission."
                                (if (= (length collected) 1) "" "s")))
          (let ((url (agent-review--gh-submit-standalone-comments
                      :pr-url pr-url
-                     :comments collected)))
+                     :comments collected
+                     :diff-text diff-text)))
            (kill-new url)
            (message "Standalone comments posted: %s (URL copied)" url)))))))
 
@@ -1738,6 +1862,26 @@ Uses the gh CLI to post comments on the pull request."
                         file))))
        files))))
 
+(defun agent-review--migrate-issue (issue)
+  "Translate a legacy ISSUE plist with :severity into the :label data model.
+Returns ISSUE unchanged if it already has a :label.  No-op for nil."
+  (cond
+   ((null issue) nil)
+   ((plist-get issue :label) issue)
+   (t
+    (let* ((sev (plist-get issue :severity))
+           (mapping (pcase sev
+                      ("error"      '("issue" . nil))
+                      ("warning"    '("suggestion" . "blocking"))
+                      ("suggestion" '("nitpick" . nil))
+                      (_            '("note" . nil))))
+           (migrated (copy-sequence issue)))
+      (setq migrated (plist-put migrated :label (car mapping)))
+      (when (cdr mapping)
+        (setq migrated (plist-put migrated :decoration (cdr mapping))))
+      (cl-remf migrated :severity)
+      migrated))))
+
 (defun agent-review-load ()
   "Load a previously saved review from disk."
   (interactive)
@@ -1748,7 +1892,8 @@ Uses the gh CLI to post comments on the pull request."
                  (insert-file-contents file)
                  (read (current-buffer))))
          (project (plist-get data :project-name))
-         (issues (plist-get data :issues))
+         (raw-issues (plist-get data :issues))
+         (issues (mapcar #'agent-review--migrate-issue raw-issues))
          (project-dir (plist-get data :project-directory))
          (review-buf (format "*Agent Review @ %s*" project))
          (diag-buf (format "*Agent Review Diagnostic @ %s*" project)))
@@ -1837,7 +1982,6 @@ agent-review, then sends an APPROVE review to GitHub."
                             urls))
            (choice (completing-read "Re-approve PR: " entries nil t))
            (pr-url (cdr (assoc choice entries))))
-      (agent-review--parse-pr-url pr-url)
       (let ((url (agent-review--gh-submit-pr-review
                   :pr-url pr-url
                   :event "APPROVE"
@@ -1943,14 +2087,21 @@ LAST-SEEN is an ISO 8601 string or nil (all comments are new)."
 
 ;;; PR Overview Buffer
 
+;; Naming note: the `agent-review-pr-overview-*', `agent-review-pr-comments-*'
+;; and `agent-review-diagnostic-*' commands below use single-dash names
+;; because interactive commands must be M-x accessible, but they are mode
+;; commands only meaningful inside their buffers — not public entry points.
+;; The public API is `agent-review', `agent-review-pr', `agent-review-commits',
+;; and `agent-review-list-reviews'.
+
 (defvar-local agent-review-pr-overview--pr-url nil
   "GitHub PR URL for this overview buffer.")
 
 (defvar-local agent-review-pr-overview--metadata nil
   "Parsed PR metadata alist for this overview buffer.")
 
-(defvar-local agent-review-pr-overview--diff nil
-  "Cached PR diff (changes alist) for code review.")
+(defvar-local agent-review-pr-overview--changes nil
+  "Cached changes alist for code review (holds a :pr-diff entry).")
 
 (defvar-local agent-review-pr-overview--explanation nil
   "Agent explanation text, nil until requested.")
@@ -2049,10 +2200,10 @@ LAST-SEEN is an ISO 8601 string or nil (all comments are new)."
       (user-error "Cancelled")))
   (let* ((metadata agent-review-pr-overview--metadata)
          (config agent-review-pr-overview--agent-config)
-         (diff agent-review-pr-overview--diff)
+         (changes agent-review-pr-overview--changes)
          (title (alist-get 'title metadata))
          (body (or (alist-get 'body metadata) ""))
-         (diff-text (or (alist-get :pr-diff diff) ""))
+         (diff-text (or (alist-get :pr-diff changes) ""))
          (overview-buffer (current-buffer))
          (prompt (format "You are reviewing a Pull Request.
 
@@ -2118,24 +2269,8 @@ of the full PR description and explanation."
          (full-text (concat message-text
                             "\n\nContext from PR overview:\n\n"
                             context "\n")))
-    (condition-case nil
-        (progn
-          (agent-shell-insert :text full-text)
-          (message "Sent to agent-shell"))
-      (error
-       (if (y-or-n-p "No agent shell found. Start one? ")
-           (progn
-             (agent-shell-start :config (agent-shell-select-config
-                                          :prompt "Select agent: "))
-             (run-with-timer 1.0 nil
-                             (lambda (text)
-                               (condition-case err
-                                   (agent-shell-insert :text text)
-                                 (error
-                                  (message "Failed to send to agent-shell: %s"
-                                           (error-message-string err)))))
-                             full-text))
-         (message "Cancelled"))))))
+    (when (eq (agent-review--send-to-agent-shell full-text) 'sent)
+      (message "Sent to agent-shell"))))
 
 (defun agent-review-pr-overview-submit-review ()
   "Submit a review for this PR (no line comments, body only)."
@@ -2149,7 +2284,7 @@ of the full PR description and explanation."
 (defun agent-review-pr-overview-code-review ()
   "Start a full code review of this PR."
   (interactive)
-  (let* ((changes agent-review-pr-overview--diff)
+  (let* ((changes agent-review-pr-overview--changes)
          (config agent-review-pr-overview--agent-config)
          (pr-url agent-review-pr-overview--pr-url)
          (review-buffer-name (agent-review--buffer-name))
@@ -2187,7 +2322,8 @@ of the full PR description and explanation."
                  (agent-review--display-issues issues config
                                                review-buffer-name diagnostic-buffer-name)
                  (with-current-buffer (get-buffer review-buffer-name)
-                   (setq agent-review--pr-url pr-url)))
+                   (setq agent-review--pr-url pr-url)
+                   (setq agent-review--pr-diff-text (alist-get :pr-diff changes))))
              (message "No issues found in review")
              (when (buffer-live-p status-buffer)
                (with-current-buffer status-buffer
@@ -2253,12 +2389,10 @@ Threads are ordered by parent creation time."
     (dolist (comment comments)
       (let ((reply-to (alist-get 'in_reply_to_id comment)))
         (if reply-to
-            (puthash reply-to
-                     (append (gethash reply-to replies) (list comment))
-                     replies)
+            (push comment (gethash reply-to replies))
           (push comment parents))))
     (mapcar (lambda (parent)
-              (cons parent (gethash (alist-get 'id parent) replies)))
+              (cons parent (nreverse (gethash (alist-get 'id parent) replies))))
             (nreverse parents))))
 
 (defun agent-review-pr-comments--group-by-file (comments)
@@ -2268,10 +2402,9 @@ where each thread is (parent . replies)."
   (let ((threads (agent-review-pr-comments--thread-comments comments))
         (groups (make-hash-table :test 'equal)))
     (dolist (thread threads)
-      (let ((path (alist-get 'path (car thread))))
-        (puthash path (append (gethash path groups) (list thread)) groups)))
+      (push thread (gethash (alist-get 'path (car thread)) groups)))
     (let ((result '()))
-      (maphash (lambda (k v) (push (cons k v) result)) groups)
+      (maphash (lambda (k v) (push (cons k (nreverse v)) result)) groups)
       (sort result (lambda (a b) (string< (car a) (car b)))))))
 
 (defun agent-review-pr-comments--insert-diff-hunk (diff-hunk)
@@ -2287,10 +2420,9 @@ where each thread is (parent . replies)."
      (t
       (insert (propertize line 'font-lock-face 'magit-diff-context) "\n")))))
 
-(defun agent-review-pr-comments--fontify-markdown-string (text)
+(defun agent-review--fontify-markdown-string (text)
   "Return TEXT with markdown font-lock faces applied.
-Unlike `agent-review-diagnostic--fontify-markdown', this does not
-modify the current buffer — it returns a new fontified string."
+Returns TEXT unchanged when `markdown-mode' is unavailable."
   (if (fboundp 'markdown-mode)
       (with-temp-buffer
         (insert text)
@@ -2338,14 +2470,17 @@ modify the current buffer — it returns a new fontified string."
                                  (substring created 0 10)
                                created))
                        (comment-id (alist-get 'id parent))
-                       (resolved (and agent-review-pr-comments--resolved
-                                      (gethash comment-id
-                                               agent-review-pr-comments--resolved)))
                        (is-new (agent-review--comment-is-new-p
                                 parent agent-review-pr-comments--last-seen))
-                       (status-tag (if resolved
-                                       (propertize " [resolved]" 'font-lock-face 'success)
-                                     (propertize " [open]" 'font-lock-face 'warning)))
+                       (status-tag (cond
+                                    ((null agent-review-pr-comments--resolved)
+                                     (propertize " [resolution unknown]"
+                                                 'font-lock-face 'shadow))
+                                    ((gethash comment-id
+                                              agent-review-pr-comments--resolved)
+                                     (propertize " [resolved]" 'font-lock-face 'success))
+                                    (t
+                                     (propertize " [open]" 'font-lock-face 'warning))))
                        (new-tag (when is-new
                                   (propertize " [NEW]" 'font-lock-face 'error))))
                   (magit-insert-section (comment parent)
@@ -2361,7 +2496,7 @@ modify the current buffer — it returns a new fontified string."
                       (agent-review-pr-comments--insert-diff-hunk diff-hunk)
                       (insert "\n"))
                     ;; Parent comment body
-                    (insert (agent-review-pr-comments--fontify-markdown-string
+                    (insert (agent-review--fontify-markdown-string
                              (or body ""))
                             "\n")
                     ;; Replies (no diff hunk, indented)
@@ -2385,7 +2520,7 @@ modify the current buffer — it returns a new fontified string."
                                         'font-lock-face 'magit-log-date)
                             (or r-new-tag ""))
                           (insert "  "
-                                  (agent-review-pr-comments--fontify-markdown-string
+                                  (agent-review--fontify-markdown-string
                                    (or r-body ""))
                                   "\n"))))
                     (insert "\n")))))))))
@@ -2456,8 +2591,9 @@ Returns the URL of the created comment."
 \\[agent-review-reply-confirm] to submit the reply.
 \\[agent-review-reply-abort] to abort.")
 
-(evil-define-key* '(normal insert) agent-review-reply-mode-map
-  (kbd "C-c m") #'agent-review-mention)
+(with-eval-after-load 'evil
+  (evil-define-key* '(normal insert) agent-review-reply-mode-map
+    (kbd "C-c m") #'agent-review-mention))
 
 (defun agent-review-reply-confirm ()
   "Submit the reply and close the edit buffer."
@@ -2468,8 +2604,7 @@ Returns the URL of the created comment."
                   (forward-line 3)
                   (buffer-substring-no-properties (point) (point-max)))))
          (pr-url agent-review--reply-pr-url)
-         (comment-id agent-review--reply-comment-id)
-         (comments-buffer agent-review--reply-comments-buffer))
+         (comment-id agent-review--reply-comment-id))
     (when (string-empty-p body)
       (user-error "Reply body is empty"))
     (when (y-or-n-p "Submit reply? ")
@@ -2492,11 +2627,6 @@ Returns the URL of the created comment."
          (value (and section (oref section value)))
          (comment-id (and value (alist-get 'id value)))
          (user (and value (alist-get 'login (alist-get 'user value))))
-         (body-preview (and value
-                            (let ((b (or (alist-get 'body value) "")))
-                              (if (> (length b) 80)
-                                  (concat (substring b 0 80) "...")
-                                b))))
          (pr-url agent-review-pr-comments--pr-url))
     (unless comment-id
       (user-error "No comment at point"))
@@ -2505,7 +2635,8 @@ Returns the URL of the created comment."
       (let ((parent-value (oref (oref section parent) value)))
         (when parent-value
           (setq comment-id (alist-get 'id parent-value)))))
-    (let ((buffer (get-buffer-create "*AR Reply*")))
+    (let ((buffer (get-buffer-create "*AR Reply*"))
+          (comments-buffer (current-buffer)))
       (with-current-buffer buffer
         (agent-review-reply-mode)
         (let ((inhibit-read-only t))
@@ -2519,7 +2650,7 @@ Returns the URL of the created comment."
                    'rear-nonsticky '(read-only))))
         (setq agent-review--reply-pr-url pr-url)
         (setq agent-review--reply-comment-id comment-id)
-        (setq agent-review--reply-comments-buffer (current-buffer))
+        (setq agent-review--reply-comments-buffer comments-buffer)
         (goto-char (point-max))
         (set-buffer-modified-p nil))
       (pop-to-buffer buffer))))
@@ -2546,24 +2677,8 @@ Returns the URL of the created comment."
          (full-text (concat message-text
                             "\n\nContext from PR comment:\n\n"
                             context "\n")))
-    (condition-case nil
-        (progn
-          (agent-shell-insert :text full-text)
-          (message "Sent to agent-shell"))
-      (error
-       (if (y-or-n-p "No agent shell found. Start one? ")
-           (progn
-             (agent-shell-start :config (agent-shell-select-config
-                                          :prompt "Select agent: "))
-             (run-with-timer 1.0 nil
-                             (lambda (text)
-                               (condition-case err
-                                   (agent-shell-insert :text text)
-                                 (error
-                                  (message "Failed to send to agent-shell: %s"
-                                           (error-message-string err)))))
-                             full-text))
-         (message "Cancelled"))))))
+    (when (eq (agent-review--send-to-agent-shell full-text) 'sent)
+      (message "Sent to agent-shell"))))
 
 (defvar-keymap agent-review-pr-comments-mode-map
   :doc "Keymap for `agent-review-pr-comments-mode'."
@@ -2591,16 +2706,26 @@ Uses magit-section for collapsible file and comment sections.
 (defun agent-review-pr-overview-view-comments ()
   "Fetch and display review comments for this PR."
   (interactive)
-  (let ((pr-url agent-review-pr-overview--pr-url))
+  (let ((pr-url agent-review-pr-overview--pr-url)
+        (overview-buffer (current-buffer)))
     (message "Fetching review comments...")
     (let* ((all-comments (agent-review--get-pr-review-comments pr-url))
            (comments (seq-filter
                       (lambda (c)
                         (let ((user-type (alist-get 'type (alist-get 'user c))))
                           (or (null user-type) (string= user-type "User"))))
-                      (or all-comments '()))))
+                      (or all-comments '())))
+           (refresh-overview
+            (lambda (count new-count)
+              (when (buffer-live-p overview-buffer)
+                (with-current-buffer overview-buffer
+                  (setq agent-review-pr-overview--human-comment-count count)
+                  (setq agent-review-pr-overview--new-comment-count new-count)
+                  (agent-review-pr-overview--render))))))
       (if (null comments)
-          (message "No human review comments on this PR")
+          (progn
+            (funcall refresh-overview 0 0)
+            (message "No human review comments on this PR"))
         (message "Fetching thread resolution status...")
         (let ((resolved (agent-review--get-pr-thread-resolution pr-url))
               (last-seen (agent-review--last-seen-get pr-url))
@@ -2614,8 +2739,9 @@ Uses magit-section for collapsible file and comment sections.
             (setq agent-review-pr-comments--resolved resolved)
             (setq agent-review-pr-comments--last-seen last-seen)
             (agent-review-pr-comments--render))
-          ;; Mark comments as seen
+          ;; Mark comments as seen and sync the overview badge
           (agent-review--last-seen-update pr-url)
+          (funcall refresh-overview (length comments) 0)
           (pop-to-buffer buffer)
           (message "%d human review comment%s"
                    (length comments)
@@ -2657,16 +2783,11 @@ Breaks lines at word boundaries.  Preserves existing newlines."
 
 (defun agent-review-diagnostic--fontify-markdown (start end)
   "Apply markdown font-lock to the region between START and END.
-Uses markdown-mode's font-lock keywords in a temp buffer to
-compute faces, then copies them to the current buffer."
+Uses `agent-review--fontify-markdown-string' to compute faces in a
+temp buffer, then replaces the region with the fontified text."
   (when (fboundp 'markdown-mode)
-    (let ((text (buffer-substring-no-properties start end))
-          (fontified nil))
-      (with-temp-buffer
-        (insert text)
-        (delay-mode-hooks (markdown-mode))
-        (font-lock-ensure)
-        (setq fontified (buffer-string)))
+    (let ((fontified (agent-review--fontify-markdown-string
+                      (buffer-substring-no-properties start end))))
       (save-excursion
         (goto-char start)
         (delete-region start end)
@@ -2677,7 +2798,7 @@ compute faces, then copies them to the current buffer."
   (let ((inhibit-read-only t)
         (file (plist-get issue :file))
         (line (plist-get issue :line))
-        (severity (plist-get issue :severity))
+        (label (plist-get issue :label))
         (short-desc (plist-get issue :short-description))
         (diagnostic (plist-get issue :diagnostic)))
     (erase-buffer)
@@ -2696,8 +2817,8 @@ compute faces, then copies them to the current buffer."
     (insert (propertize (format "%s:%d" file line)
                         'face 'bold)
             "\n")
-    (insert (propertize (upcase severity)
-                        'face (agent-review--severity-face severity))
+    (insert (propertize (upcase (agent-review--label-display issue))
+                        'face (agent-review--label-face label))
             "  "
             (propertize short-desc 'face 'italic)
             "\n")
@@ -2734,24 +2855,8 @@ compute faces, then copies them to the current buffer."
     (let* ((prompt-header "Implement a fix for the following code review issue:\n\n")
            (issue-text (agent-review--format-issue-for-agent issue))
            (full-text (concat prompt-header issue-text "\n")))
-      (condition-case nil
-          (progn
-            (agent-shell-insert :text full-text)
-            (message "Sent issue to agent-shell"))
-        (error
-         (if (y-or-n-p "No agent shell found. Start one? ")
-             (progn
-               (agent-shell-start :config (agent-shell-select-config
-                                            :prompt "Select agent: "))
-               (run-with-timer 1.0 nil
-                               (lambda (text)
-                                 (condition-case err
-                                     (agent-shell-insert :text text)
-                                   (error
-                                    (message "Failed to send to agent-shell: %s"
-                                             (error-message-string err)))))
-                               full-text))
-           (message "Cancelled")))))))
+      (when (eq (agent-review--send-to-agent-shell full-text) 'sent)
+        (message "Sent issue to agent-shell")))))
 
 (defun agent-review-diagnostic-copy-issue ()
   "Copy the current diagnostic issue to the kill ring."
@@ -2795,24 +2900,8 @@ diagnostic appended as context."
            (full-text (concat message-text
                               "\n\nContext from code review:\n\n"
                               context "\n")))
-      (condition-case nil
-          (progn
-            (agent-shell-insert :text full-text)
-            (message "Sent to agent-shell"))
-        (error
-         (if (y-or-n-p "No agent shell found. Start one? ")
-             (progn
-               (agent-shell-start :config (agent-shell-select-config
-                                            :prompt "Select agent: "))
-               (run-with-timer 1.0 nil
-                               (lambda (text)
-                                 (condition-case err
-                                     (agent-shell-insert :text text)
-                                   (error
-                                    (message "Failed to send to agent-shell: %s"
-                                             (error-message-string err)))))
-                               full-text))
-           (message "Cancelled")))))))
+      (when (eq (agent-review--send-to-agent-shell full-text) 'sent)
+        (message "Sent to agent-shell")))))
 
 (defvar-keymap agent-review-diagnostic-mode-map
   :doc "Keymap for `agent-review-diagnostic-mode'."
@@ -2891,7 +2980,7 @@ Opens the *Agent Review Diagnostic* buffer in a side window."
 \\{agent-review-mode-map}"
   (setq tabulated-list-format
         [("" 1 nil)  ; Mark column
-         ("Severity" 10 t)
+         ("Label" 16 t)
          ("File" 30 t)
          ("Line" 6 t :right-align t)
          ("Issue" 0 nil)])
@@ -3173,7 +3262,7 @@ With optional CONFIG, use that agent configuration."
           (agent-review-pr-overview-mode)
           (setq agent-review-pr-overview--pr-url pr-url)
           (setq agent-review-pr-overview--metadata metadata)
-          (setq agent-review-pr-overview--diff changes)
+          (setq agent-review-pr-overview--changes changes)
           (setq agent-review-pr-overview--agent-config agent-config)
           (setq agent-review-pr-overview--explanation nil)
           (setq agent-review-pr-overview--explaining nil)

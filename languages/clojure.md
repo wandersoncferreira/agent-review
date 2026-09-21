@@ -33,3 +33,45 @@ You are reviewing Clojure code. Apply these language-specific guidelines:
 - Ignoring return values of swap!/send/alter (swallowing errors silently)
 - Using Thread/sleep in core.async go blocks (blocks the thread pool)
 - Raw Java interop when a Clojure wrapper library exists (e.g., clj-http vs HttpClient)
+
+## AI-Slop & Overengineering — Hunt These Aggressively
+AI-generated code has signature failure modes. Treat them as first-class findings, not style nits. Core principle: the simplest correct implementation wins — three similar lines beat a premature abstraction.
+
+**Comment slop**
+- Comments that narrate WHAT the code does (";; map over users"). A comment must state a non-obvious WHY (hidden constraint, workaround, invariant) or be deleted.
+- Docstrings that restate the arglist with no added information.
+- Comments addressed to the reviewer or the current change ("refactored to...", "as requested", "now uses X") — code talks to the next reader, not to this PR.
+- Section-banner comments in short namespaces.
+
+**Overengineering / speculative generality**
+- Wrapper fns that rename clojure.core functions without adding semantics; single-caller helpers that add indirection without meaning.
+- Introducing atoms/refs/state for what a pure function and a threading macro already express.
+- Options maps, multimethod dispatches, or protocol indirection with exactly one implementation and no second one in sight.
+- Backwards-compatibility aliases or re-exported vars when nothing depends on the old names.
+- Reimplementation of clojure.core or of an existing utility namespace in the same repo.
+- Defensive checks against impossible states: :pre/:post or manual asserts re-checking what a spec/malli boundary already validates, nil-checks on values produced internally.
+- Blanket try/catch wrapping whole function bodies "just in case"; catch-log-continue that turns a crash into silent corruption.
+
+**Overexplaining**
+- Committed session artifacts: summaries, handoff notes, plan/checklist files (✅/☐), "what I did" narration — these never belong in the repo.
+- Docs or README sections that restate the code, or cite AI review as authority ("per Claude review").
+- Log messages or errors that hedge ("something went wrong") instead of stating what failed and with which values.
+
+**Test slop**
+- Volume is not coverage: near-identical happy-path tests pinning the same code path. One behavior per test.
+- Tests asserting internal call order or mock/stub call counts instead of observable behavior and returned data.
+- Tests that restate the implementation — if you can't name the invariant being defended, the test is slop.
+
+**Naming and mechanical tells**
+- enhanced-/improved-/new-/-v2/comprehensive/robust naming.
+- Emoji in code, comments, or log output.
+- Dead code, commented-out forms, and unused requires left "just in case".
+
+**Labeling slop findings**: narrating comments, dead code, unused options, committed session artifacts → `issue` (they rot immediately). Premature abstraction where you can name the simpler shape → `suggestion` with the concrete inline alternative. Suspected speculative generality you can't confirm from the diff → `question`. Never soften slop to `nitpick`.
+
+## Labeling Guidance (Conventional Comments)
+- "Gotchas to Flag" entries are `issue` — head-of-lazy-seq holds, swap! with side effects, Thread/sleep in go blocks are real bugs.
+- "Structural Alternatives" (cond→multimethod, nested let→threading macro, recursion→reduce/transducer) are `suggestion` — name the concrete refactor target.
+- Idiom-only nits (when vs (if x y nil), :key m vs (get m :key)) are `nitpick` and non-blocking.
+- When you suspect reflection or laziness pitfalls but cannot confirm without seeing call sites, use `question` instead of `issue`.
+- Use `praise` for clean threading-macro pipelines, well-factored pure functions, or judicious protocol use worth reinforcing.

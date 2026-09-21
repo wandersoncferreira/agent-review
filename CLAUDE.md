@@ -69,8 +69,9 @@ Located at: `~/.config/emacs/.local/straight/repos/acp.el/`
 
 - `acp-make-session-prompt-request` - Send prompt to agent
   - `:session-id` from session creation response
-  - `:prompt` is a VECTOR of content block objects
-  - Content blocks have structure: `((type . "text") (text . "prompt text"))`
+  - `:prompt` is a VECTOR of content block alists, built like this
+    (the single canonical form — see Common Pitfalls #2 and #3):
+    `(vector (list (cons 'type "text") (cons 'text "prompt text")))`
 
 **Critical Details:**
 
@@ -148,13 +149,15 @@ agent-shell-agent-configs
    - Cleanup session and client
 
 3. **Parse response** (`agent-review--parse-issues`)
-   - Extract lines matching: `FILE:LINE|SEVERITY|DESCRIPTION`
-   - Build issue plists: `(:file "..." :line N :severity "..." :description "...")`
-   - Sort by file, then severity (error > warning > suggestion)
+   - Extract lines matching: `FILE:LINE|LABEL[(DECORATION)]|SHORT_DESCRIPTION|DIAGNOSTIC`
+   - LABEL is a [Conventional Comments](https://conventionalcomments.org/#labels) label: `issue`, `suggestion`, `nitpick`, `question`, `praise`, `todo`, `chore`, `thought`, `note`
+   - DECORATION is optional: `blocking`, `non-blocking`, `if-minor`, or custom
+   - Build issue plists: `(:file "..." :line N :label "..." :decoration "..." :short-description "..." :diagnostic "...")`
+   - Sort by file, then label priority (blocking-by-default labels rank above optional ones)
 
 4. **Display** (`agent-review--display-issues`)
    - Use `tabulated-list-mode`
-   - Color-code severity levels
+   - Color-code by label (issue → error, suggestion/question → info, nitpick/thought/note → shadow, praise → success)
    - Allow navigation with RET
 
 ## Common Pitfalls

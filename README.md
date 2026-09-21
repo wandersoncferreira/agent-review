@@ -5,7 +5,7 @@ https://github.com/user-attachments/assets/8ad86c2d-a91e-4f69-b51a-0f7f72ae0b19
 
 `agent-review` enables a streamlined workflow: use one AI agent (Claude, Cursor, Gemini) to implement features, then instantly get a second opinion from a different agent. The package automatically collects your git changes and sends them to your chosen AI agent for review. The cross-agent review catches issues that single-agent workflows miss, while the tight feedback loop means you fix problems quicker and more efficiently.
 
-All findings display in a navigable list interface where you can jump to issues, triage by severity, and send fixes back to your implementation agent—closing the loop without leaving Emacs.
+All findings display in a navigable list interface where you can jump to issues, triage by [Conventional Comments](https://conventionalcomments.org/) label, and send fixes back to your implementation agent—closing the loop without leaving Emacs.
 
 ## Requirements
 
@@ -36,7 +36,7 @@ Add to your `packages.el`:
 (package! agent-review
   :recipe (:host github
            :repo "nineluj/agent-review"
-           :files ("*.el")))
+           :files ("*.el" "languages/*.md")))
 ```
 
 ### Manual
@@ -110,18 +110,21 @@ If git is not in your PATH:
 ## How It Works
 
 1. **Collection**: Runs `git diff` and `git diff --cached` to get changes
-2. **Analysis**: Sends changes to AI agent with structured prompt
-3. **Parsing**: Extracts issues in format `FILE:LINE|SEVERITY|DESCRIPTION`
-4. **Display**: Shows results in tabulated-list-mode with color-coding
+2. **Analysis**: Sends changes to AI agent with structured prompt that prescribes [Conventional Comments](https://conventionalcomments.org/#labels)
+3. **Parsing**: Extracts findings in format `FILE:LINE|LABEL[(DECORATION)]|SHORT_DESCRIPTION|DIAGNOSTIC`
+4. **Display**: Shows results in tabulated-list-mode with color-coding by label
+
+Labels in use: `issue`, `suggestion`, `nitpick`, `question`, `praise`, `todo`, `chore`, `thought`, `note`. Optional decorations: `(blocking)`, `(non-blocking)`, `(if-minor)`.
 
 ## Example Output
 
 ```
-  Severity    File                Line  Description
-────────────────────────────────────────────────────────────────
-  error       src/main.el           42  Variable 'unused-var' is defined but never used
-* warning     lib/utils.el          15  Function docstring is missing
-  suggestion  tests/test.el          8  Consider adding edge case test
+  Label                File                Line  Issue
+─────────────────────────────────────────────────────────────────────────
+  issue(blocking)      src/cache.py          42  Race in cache reload
+* suggestion           src/cache.py          88  Replace branch chain with dispatch dict
+  nitpick              lib/utils.py          15  Prefer f-string over .format()
+  praise               src/api.py           120  Nice extraction of the validator
 ```
 
 (Issues can be marked with `m` for batch operations)
@@ -206,7 +209,7 @@ This fork adds the following features on top of the upstream `nineluj/agent-revi
 
 ### GitHub issue creation
 - `I` in the review buffer creates a GitHub issue from marked items (or issue at point) via `gh` CLI
-- Single issues get a detailed title with severity/file/line; multiple issues are grouped into one issue
+- Single issues get a detailed title with label/file/line; multiple issues are grouped into one issue
 - URL is copied to the kill ring on success
 
 ### Save / Load / Delete reviews
